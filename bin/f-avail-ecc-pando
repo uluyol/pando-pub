@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+#
+# Pando:
+# - Fixed-size quorums
+# - 1-split intersection
+# - Asymmetric (i.e. tradeoff read/write latency)
+# - Flexible Paxos
+# - Partial delegation
+#
+# This formulation is slightly simplified compared to what was used
+# to generate the NSDI'20 data as we had additional ideas that we
+# dropped.
+#
+# The analysis in the paper disabled those features, and this further
+# simplifies the code. A basic A/B test did not show significant
+# differences between the two formulations.
+
+from typing import Iterable, List, Set, Tuple
+
+import argparse
+import itertools
+import os
+import sys
+
+from formulations import data, generation
+
+def sum_of(it):
+	return " + ".join(it)
+
+class Context(object):
+	def __init__(self):
+		self.multi_goal = False
+		self.data_center_in_use = [] # type: List[int]
+		self.sparsified = set() # type: Set[int]
+		self._access_set = set() # type: Set[int]
+		self.latency = None # type: data.Latency
+		self.max_storage_overhead = -1
+		self.max_read = -1
+		self.max_write = -1
+		self.max_failures = -1
+		self.percentile = "MISSING"
+		self.dest_lp_path = ""
+		self.split_prop = True # i.e. partial delegation
+		self.flexible_paxos = True
+
+		self.max_splits = -1
+		self.max_replicas = -1
+
+		self.sym = False
+		self.repl = False
+		self.force_ecc = False
+
+	@property
+	def replication_size(self):
+		return self.max_failures*2 + 1
+
+	def emit_mg_meta(self, fout, key: str, val: str):
+		if self.multi_goal:
+			fout.write("{0}: {1}\n".format(key, val))
+
+	def access_set_add(self, dc: int):
+		self._access_set.add(dc)
+
+	def in_access_set(self, dc: int):
+		return dc in self._access_set
+
+	def access_set_iter(self):
+		for dc in self.data_center_in_use:
+			if dc in self._access_set:
+				yield dc
+
+	@property
+	def access_set_size(self):
+		return len(self._access_set)
+
+def datacontent(subpath):
+	return os.getenv("DATADIR", "MISSING_DATADIR") + "/" + subpath
+
+def load_inputs(ctx: Context):
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--access-sets", required=True)
+	parser.add_argument("--latencies",
+		default=datacontent("net-only-latency.txt"))
+	parser.add_argument("--loc-index-map",
+		default=datacontent("loc-index-map.txt"))
+	parser.add_argument("--sparsified", default="")
+	parser.add_argument("--max-storage-overhead", required=True, type=float)
+	parser.add_argument("--max-read", type=float, default=data.MAX_LATENCY)
+	parser.add_argument("--max-write", type=str, default=str(data.MAX_LATENCY))
+	parser.add_argument("--max-failures", required=True, type=int)
+	parser.add_argument("--percentile", default="50")
+	parser.add_argument("--lp-path", default="formulation.lp")
+	parser.add_argument("--multi-goal", dest="multi_goal", action="store_true", default=False)
+
+	parser.add_argument("--max-splits", type=int, default=6)
+	parser.add_argument("--max-replicas", type=int, default=80)
+
+	parser.add_argument("--sym", dest="sym", action="store_true", default=False)
+	parser.add_argument("--repl", dest="repl", action="store_true", default=False)
+	parser.add_argument("--force-ecc", dest="force_ecc", action="store_true", default=False)
+	parser.add_argument("--no-split-prop", dest="no_split_prop", action="store_true", default=False)
+	parser.add_argument("--no-fp", dest="no_fp", action="store_true", default=False)
+
+	args = parser.parse_args()
+
+	if args.max_failures != 1:
+		print("BUG: can only handle max-failures of 1", file=sys.stderr)
+		sys.exit(3)
+
+	if args.repl and args.force_ecc:
+		print("cannot use replication and force ecc at the same time", file=sys.stderr)
+		sys.exit(3)
+
+	ctx.multi_goal = args.multi_goal
+	ctx.max_storage_overhead = args.max_storage_overhead
+
+	if args.max_write.endswith("x"):
+		raise NotImplementedError("relative write SLO support is broken")
+	ctx.max_write = float(args.max_write)
+	ctx.max_read = args.max_read
+	if ctx.max_write > 0 and ctx.max_write < ctx.max_read:
+		ctx.max_read = ctx.max_write
+
+	ctx.max_failures = args.max_failures
+	ctx.percentile = args.percentile
+	ctx.dest_lp_path = args.lp_path
+
+	ctx.max_splits = args.max_splits
+	ctx.max_replicas = args.max_replicas
+
+	ctx.sym = args.sym
+	ctx.repl = args.repl
+	ctx.force_ecc = args.force_ecc
+	ctx.split_prop = not args.no_split_prop
+	ctx.flexible_paxos = not args.no_fp
+
+	with open(args.loc_index_map) as fin:
+		dcs = []
+		for line in fin:
+			if line.startswith("#"):
+				continue
+			fields = line.split()
+			dcs.append(int(fields[1]))
+		ctx.data_center_in_use = dcs
+
+	for fe in data.access_set_fes(args.access_sets):
+		ctx.access_set_add(fe)
+	if ctx.access_set_size == 0:
+		print("got empty access set", file=sys.stderr)
+		sys.exit(4)
+
+	ctx.latency = data.Latency(ctx.data_center_in_use, ["50", "80", "90", "99", "99.9"], args.latencies)
+	if args.sparsified:
+		raise NotImplementedError
+	else:
+		ctx.sparsified = set(ctx.data_center_in_use)
+
+HEADER = """Notation:
+
+N: number of DCs
+GET_LATENCY(m, n): median get latency between DC m and n
+PUT_LATENCY(m, n): median put latency between DC m and n
+F: maximum number of tolerable failures
+MAX_OVERHEAD: max allowable storage overhead
+MAX_READ: read latency SLO
+MAX_WRITE: write latency SLO
+
+Continuous Variables:
+
+L: overall max (median) read/phase 1 latency across quorums
+WL: overall max (median) write latency across quorums
+L_n: median read/phase 1 latency seen from FE n (for the best quorum)
+WL_n: median write latency seen from FE n (for the best quorum)
+P1RL_m_n: median phase 1 latency seen from FE m using DS n and the read quorum (for the best quorum)
+P1WL_m_n: median phase 1 latency seen from FE m using DS n and the write quorum (for the best quorum)
+P2RL_m_n: median phase 2 latency seen from FE m using DS n and the read quorum (for the best quorum)
+P2WL_m_n: median phase 2 latency seen from FE m using DS n and the write quorum (for the best quorum)
+
+ISTOHEAD: (negative) gap between MAX_OVERHEAD and storage overhead
+UPDATE: total update cost (= NREPLICAS - NSPLITS + 1)
+
+Integer Variable:
+
+NSPLITS: number of splits
+NREPLICAS: number of replicas overall
+M_A: number of replicas in a phase 1a quorum
+M_R: number of replicas in a phase 1b quorum
+M_W: number of replicas in a write quorum
+
+Binary Variables:
+
+C_n: 1 if DC n is replica
+A_m_n: 1 if DC n is a part of FE m's best phase 1a quorum [defined only for FE m]
+R_m_n: 1 if DC n is a part of FE m's best phase 1b quorum [defined only for FE m]
+W_m_n: 1 if DC n is a part of FE m's best phase 2 quorum [defined only for FE m]
+DA_m_n: 1 if DC n is the chosen delegate for running FE m's write operations using read quorum [defined only for FE m]
+DW_m_n: 1 if DC n is the chosen delegate for running FE m's write operations using write quorum only [defined only for FE m]
+
+Bounds:
+	-inf ≤ ISTOHEAD ≤ 0
+	NSPLITS ≥ 1
+	P1RL_m_n ≥ 0
+	P1WL_m_n ≥ 0
+	P2RL_m_n ≥ 0
+	P2WL_m_n ≥ 0
+
+Constraints:
+
+	# Latency constraints
+	LATENCY(m, n) * A_m_n - L ≤ 0 [for all FE m, all n]
+	LATENCY(m, n) * A_m_n - L_m ≤ 0 [for all FE m, all n]
+
+	(LATENCY(m, n) + LATENCY(n, l))/2 * A_m_n + MAX_LATENCY * DA_m_l - P1RL_m_l ≤ MAX_LATENCY [for all FE m, all l, n]
+	(LATENCY(m, n) + LATENCY(n, l))/2 * W_m_n + MAX_LATENCY * DW_m_l - P1WL_m_l ≤ MAX_LATENCY [for all FE m, all l, n]
+	(LATENCY(m, n) + LATENCY(l, n))/2 * W_m_n + MAX_LATENCY * DA_m_l - P2RL_m_l ≤ MAX_LATENCY [for all FE m, all l, n]
+	(LATENCY(m, n) + LATENCY(l, n))/2 * W_m_n + MAX_LATENCY * DW_m_l - P2WL_m_l ≤ MAX_LATENCY [for all FE m, all l, n]
+
+	P1RL_m_n + P2RL_m_n - WL_m ≤ 0 [for all FE m, all n]
+	P1WL_m_n + P2WL_m_n - WL_m ≤ 0 [for all FE m, all n]
+	P1RL_m_n + P2RL_m_n - WL ≤ 0 [for all FE m, all n]
+	P1WL_m_n + P2WL_m_n - WL ≤ 0 [for all FE m, all n]
+
+	L ≤ MAX_READ
+	WL ≤ MAX_WRITE
+
+	# Delegate constraints
+	DA_m_1 + ... + DA_m_N + DW_m_1 + ... + DW_m_N = 1 # Enforce only one delegate (and pick either A or W as Phase 1 quorum)
+	DA_m_n - W_m_n ≤ 0 [if m != n]
+	DW_m_n - W_m_n ≤ 0 [if m != n]
+
+	# Quorum constraints
+	A_m_n - R_m_n ≤ 0 # Fast read quorum is a subset of slow one. Limits search space
+	A_m_1 + ... + A_m_N - M_A = 0 [for all FE m]
+	R_m_1 + ... + R_m_N - M_R = 0 [for all FE m]
+	W_m_1 + ... + W_m_N - M_W = 0 [for all FE m]
+
+	# DC Selection/Quorum member constraints
+	∑ A_m_n + ∑ R_m_n + ∑ W_m_n - 3N C_n ≤ 0 [for all DC n]
+
+	# DC Number constraint
+	# To bound overhead, ensure that K+R / K ≤ MAX_OVERHEAD
+	# K = NSPLITS
+	# K+R = ∑ SPLITS_n
+	# Besdies transforming this to be linear, we multiply everything by 100.
+	# Since MAX_OVERHEAD is a float, this will get us within 1%.
+	C_1 + ... + C_N - NREPLICAS = 0
+	ISTOHEAD - 100 NREPLICAS + 100 * MAX_OVERHEAD NSPLITS = 0
+	ISTOHEAD ≤ 0
+	M_A ≥ F+1
+	M_A - NSPLITS ≥ 0
+	M_R - NSPLITS ≥ F
+	M_W - NSPLITS ≥ F
+	M_A + M_W - NREPLICAS ≥ 1
+	M_R + M_W - NSPLITS - NREPLICAS ≥ 0
+	M_W + M_W - NSPLITS - NREPLICAS ≥ 0
+	NREPLICAS - NSPLITS ≥ 2F
+	NREPLICAS - NSPLITS - UPDATE = -1
+
+	# Implementation constraints
+	NSPLITS ≤ MAX_NSPLITS
+	NREPLICAS ≤ MAX_NREPLICAS
+	DA_m_n = 0 [for n not sparsified]
+	DW_m_n = 0 [for n not sparsified]
+
+	# Bias constraints
+	# Used to prefer local and read delegates over when optimizing cost
+	∑ DA_m_n - NRDELS ≥ 0
+	∑ DA_m_m + ∑ DW_m_m - NSDELS ≥ 0
+
+	# Optional Constraints used to force ECC, Symmetry, Replication
+	# Symmetry:
+	R_m_n - W_m_n = 0
+	# Replication:
+	NSPLITS = 1
+	# ECC:
+	NSPLITS ≥ 2
+"""
+
+def output_header(fout):
+	for line in HEADER.splitlines():
+		fout.write("\\ " + line + "\n")
+	fout.write("\n")
+
+def output_objective_function(ctx: Context, fout, mgout):
+	fout.write("MINIMIZE\n\tGOAL : ")
+
+	rgoal = "1000000 L"
+	wgoal = "1000000 WL"
+	for dc in ctx.access_set_iter():
+		rgoal += " + L_{0} ".format(dc)
+		wgoal += " + WL_{0} ".format(dc)
+
+	if ctx.multi_goal:
+		ctx.emit_mg_meta(mgout, "read-latency-goal", rgoal)
+		ctx.emit_mg_meta(mgout, "write-latency-goal", wgoal)
+		ctx.emit_mg_meta(mgout, "storage-overhead-goal", "ISTOHEAD")
+		ctx.emit_mg_meta(mgout, "update-goal", "UPDATE")
+		ctx.emit_mg_meta(mgout, "read-latency-var", "L")
+		ctx.emit_mg_meta(mgout, "write-latency-var", "WL")
+		ctx.emit_mg_meta(mgout, "storage-overhead-var", "ISTOHEAD")
+		ctx.emit_mg_meta(mgout, "update-goal-var", "UPDATE")
+
+		ctx.emit_mg_meta(mgout, "storage-overhead-subvar",
+			",".join("C_" + str(dc) for dc in ctx.data_center_in_use))
+		ctx.emit_mg_meta(mgout, "storage-overhead-goal-2", "1000 NREPLICAS - 10 NSDELS - NRDELS")
+		ctx.emit_mg_meta(mgout, "storage-overhead-var-2", "NREPLICAS,NSDELS,NRDELS")
+		fout.write("%%GOAL%%")
+	else:
+		fout.write(rgoal)
+
+	fout.write('\n')
+
+def add_objective_latency_constraints(ctx: Context, constraints: List[str]):
+	aset = list(ctx.access_set_iter())
+	dcs = ctx.data_center_in_use
+
+	getlat = lambda a, b: ctx.latency.get[ctx.percentile][(a, b)]
+	putlat = lambda a, b: ctx.latency.put[ctx.percentile][(a, b)]
+
+	for fe, ds in itertools.product(aset, dcs):
+		constraints.extend([
+			"CL_FE_{0}_ST_{1} : {2} A_{0}_{1} - L <= 0".format(
+				fe, ds, getlat(fe, ds)),
+			"CL1_FE_{0}_ST_{1} : {2} A_{0}_{1} - L_{0} <= 0".format(
+				fe, ds, getlat(fe, ds)),
+		])
+
+	for fe, rep in itertools.product(aset, dcs):
+		for ds in dcs:
+			p1lat = (getlat(fe, ds) + getlat(ds, rep)) / 2
+			p2lat = (putlat(rep, ds) + getlat(ds, fe)) / 2
+			if not ctx.split_prop:
+				p1lat = getlat(fe, rep)/2 + getlat(rep, ds)
+				p2lat = getlat(fe, rep)/2 + putlat(rep, ds)
+			constraints.extend([
+				"CLW_FER_P1_{fe}_{rep}_{dst} : {lat} A_{fe}_{dst} + {max_lat} DA_{fe}_{rep} - P1RL_{fe}_{rep} <= {max_lat}".format(
+					fe=fe, dst=ds, rep=rep, max_lat=data.MAX_LATENCY, lat=p1lat),
+				"CLW_FER_P2_{fe}_{rep}_{dst} : {lat} W_{fe}_{dst} + {max_lat} DA_{fe}_{rep} - P2RL_{fe}_{rep} <= {max_lat}".format(
+					fe=fe, dst=ds, rep=rep, max_lat=data.MAX_LATENCY, lat=p2lat),
+				"CLW_FEW_P1_{fe}_{rep}_{dst} : {lat} W_{fe}_{dst} + {max_lat} DW_{fe}_{rep} - P1WL_{fe}_{rep} <= {max_lat}".format(
+					fe=fe, dst=ds, rep=rep, max_lat=data.MAX_LATENCY, lat=p1lat),
+				"CLW_FEW_P2_{fe}_{rep}_{dst} : {lat} W_{fe}_{dst} + {max_lat} DW_{fe}_{rep} - P2WL_{fe}_{rep} <= {max_lat}".format(
+					fe=fe, dst=ds, rep=rep, max_lat=data.MAX_LATENCY, lat=p2lat),
+			])
+
+		constraints.extend([
+			"CLW_FE_{0}_DSTR_{1} : P1RL_{0}_{1} + P2RL_{0}_{1} - WL <= 0".format(fe, rep),
+			"CLW_FE_{0}_DSTW_{1} : P1WL_{0}_{1} + P2WL_{0}_{1} - WL <= 0".format(fe, rep),
+			"CLW1_FE_{0}_DSTR_{1} : P1RL_{0}_{1} + P2RL_{0}_{1} - WL_{0} <= 0".format(fe, rep),
+			"CLW1_FE_{0}_DSTW_{1} : P1WL_{0}_{1} + P2WL_{0}_{1} - WL_{0} <= 0".format(fe, rep),
+		])
+
+	constraints.extend([
+		"CLSLO_R : L <= " + str(ctx.max_read),
+		"CLSLO_W_ABS : WL <= {0}".format(ctx.max_write),
+	])
+
+def add_delegate_constraints(ctx: Context, constraints: List[str]) -> None:
+	aset = list(ctx.access_set_iter())
+	dcs = ctx.data_center_in_use
+
+	for fe in aset:
+		constraints.append("CDEL_{0}_PICK : {1} + {2} = 1".format(
+			fe,
+			sum_of("DA_{0}_{1}".format(fe, dc) for dc in dcs),
+			sum_of("DW_{0}_{1}".format(fe, dc) for dc in dcs)))
+
+	for fe, dc in itertools.product(aset, dcs):
+		if fe == dc:
+			constraints.append("CDEL_{0}_SAMEUSEFP : DW_{0}_{0} = 0".format(fe))
+			continue
+		constraints.extend([
+			"CDEL_{0}_{1}_INP2_A : DA_{0}_{1} - W_{0}_{1} <= 0".format(fe, dc),
+			"CDEL_{0}_{1}_INP2_W : DW_{0}_{1} - W_{0}_{1} <= 0".format(fe, dc),
+		])
+
+def add_data_center_number_constraints(ctx: Context, constraints: List[str]) -> None:
+	constraints.extend([
+		"CDC_NUM : {0} - NREPLICAS = 0".format(
+			sum_of("C_" + str(dc) for dc in ctx.data_center_in_use)),
+		"CDC_ISTOHEAD : ISTOHEAD - 100 NREPLICAS + {0} NSPLITS = 0".format(
+			100*ctx.max_storage_overhead),
+		"CDC_ISTOHEAD_BOUND : ISTOHEAD <= 0",
+		"CDC_AQ_SIZE_1 : M_A >= {0}".format(ctx.max_failures+1),
+		"CDC_AQ_SIZE_2 : M_A - NSPLITS >= 0",
+		"CDC_RQ_SIZE : M_R - NSPLITS >= {0}".format(ctx.max_failures),
+		"CDC_WQ_SIZE : M_W - NSPLITS >= {0}".format(ctx.max_failures),
+		"CDC_AQ_WQ_REL : M_A + M_W - NREPLICAS >= 1",
+		"CDC_RQ_WQ_REL : M_R + M_W - NSPLITS - NREPLICAS >= 0",
+		"CDC_WQ_WQ_REL : M_W + M_W - NSPLITS - NREPLICAS >= 0",
+		"CDC_TOL_FAIL : NREPLICAS - NSPLITS >= {0}".format(2*ctx.max_failures),
+		"CDC_UPDATE : NREPLICAS - NSPLITS - UPDATE = -1",
+	])
+
+def mult_A_x(cpre: str, Ax: str, A: str, x: str, A_upper_bound: int) -> Iterable[str]:
+	kwargs = {
+		"cpre": cpre,
+		"z": Ax,
+		"A": A,
+		"x": x,
+		"Abar": A_upper_bound,
+		"negAbar": -A_upper_bound,
+	}
+	yield "{cpre}_1: {z} - {Abar} {x} <= 0".format(**kwargs)
+	yield "{cpre}_2: {z} - {A} <= 0".format(**kwargs)
+	yield "{cpre}_3: {z} - {A} + {Abar} {x} >= {negAbar}".format(**kwargs)
+	yield "{cpre}_4: {z} >= 0".format(**kwargs)
+
+def add_quorum_constraints(ctx: Context, constraints: List[str]) -> None:
+	dcs = ctx.data_center_in_use
+	aset = list(ctx.access_set_iter())
+
+	for fe, dc in itertools.product(aset, dcs):
+		constraints.append("CQ_A_IN_R_{0}_{1} : A_{0}_{1} - R_{0}_{1} <= 0".format(fe, dc))
+	for fe in aset:
+		constraints.extend([
+			"CQUORUMA_{0} : {1} - M_A = 0".format(fe,
+				sum_of("A_{0}_{1}".format(fe, dc)
+					for dc in ctx.data_center_in_use)),
+			"CQUORUMR_{0} : {1} - M_R = 0".format(fe,
+				sum_of("R_{0}_{1}".format(fe, dc)
+					for dc in ctx.data_center_in_use)),
+			"CQUORUMW_{0} : {1} - M_W = 0".format(fe,
+				sum_of("W_{0}_{1}".format(fe, dc)
+					for dc in ctx.data_center_in_use)),
+		])
+
+def add_sym_constraints(ctx: Context, constraints: List[str]) -> None:
+	if not ctx.sym:
+		return
+	aset = list(ctx.access_set_iter())
+	dcs = ctx.data_center_in_use
+	for fe, dc in itertools.product(aset, dcs):
+		constraints.extend([
+			"CSYM_W_{0}_{1} : R_{0}_{1} - W_{0}_{1} = 0".format(fe, dc),
+		])
+
+def add_no_var_quorum_constraints(ctx: Context, constraints: List[str]) -> None:
+	aset = list(ctx.access_set_iter())
+	dcs = ctx.data_center_in_use
+	for fe in aset:
+		constraints.append("C_NOVQ_{0}_A : {1} - M_A = 0".format(fe, sum_of("A_{0}_{1}".format(fe, dc) for dc in dcs)))
+		constraints.append("C_NOVQ_{0}_R : {1} - M_R = 0".format(fe, sum_of("R_{0}_{1}".format(fe, dc) for dc in dcs)))
+		constraints.append("C_NOVQ_{0}_W : {1} - M_W = 0".format(fe, sum_of("W_{0}_{1}".format(fe, dc) for dc in dcs)))
+
+def add_no_flexible_constraints(ctx: Context, constraints: List[str]) -> None:
+	aset = list(ctx.access_set_iter())
+	dcs = ctx.data_center_in_use
+	if not ctx.flexible_paxos:
+		for fe, dc in itertools.product(aset, dcs):
+			constraints.append("C_NOFP_{0}_{1} : DA_{0}_{1} = 0".format(fe, dc))
+			constraints.append("C_NOFP_SAMERW_{0}_{1} : R_{0}_{1} - W_{0}_{1} = 0".format(fe, dc))
+
+def add_repl_constraints(ctx: Context, constraints: List[str]) -> None:
+	if ctx.repl:
+		constraints.append("CFORCEREPL : NSPLITS = 1")
+	elif ctx.force_ecc:
+		constraints.append("CFORCEECC : NSPLITS >= 2")
+
+def add_data_center_selection_constraints(ctx: Context, constraints: List[str]):
+	aset = list(ctx.access_set_iter())
+	dcs = ctx.data_center_in_use
+
+	for dc_k in dcs:
+		constraints.extend([
+			"CDCSEL_{0} : {1} + {2} + {3} - {4} C_{0} <= 0".format(
+				dc_k,
+				sum_of("A_{0}_{1}".format(dc_i, dc_k) for dc_i in aset),
+				sum_of("R_{0}_{1}".format(dc_i, dc_k) for dc_i in aset),
+				sum_of("W_{0}_{1}".format(dc_i, dc_k) for dc_i in aset),
+				3 * len(dcs)),
+		])
+
+def add_implementation_constraints(ctx: Context, constraints: List[str]):
+	if ctx.max_splits > 0:
+		constraints.append("C_IMPL_NSPLITS : NSPLITS <= {0}".format(ctx.max_splits))
+	if ctx.max_replicas > 0:
+		constraints.append("C_IMPL_NREPLICAS : NREPLICAS <= {0}".format(ctx.max_replicas))
+	for fe in ctx.access_set_iter():
+		for dc in ctx.data_center_in_use:
+			if dc in ctx.sparsified:
+				continue
+			constraints.append("C_IMPL_NOT_SPARSE_A_{0}_{1} : DA_{0}_{1} = 0".format(fe, dc))
+			constraints.append("C_IMPL_NOT_SPARSE_W_{0}_{1} : DW_{0}_{1} = 0".format(fe, dc))
+
+def add_bad_constraints(ctx: Context, constraints: List[str]):
+	aset = list(ctx.access_set_iter())
+	dcs = ctx.data_center_in_use
+
+	getlat = lambda a, b: ctx.latency.get[ctx.percentile][(a, b)]
+	putlat = lambda a, b: ctx.latency.put[ctx.percentile][(a, b)]
+
+	for fe, ds in itertools.product(aset, dcs):
+		if ctx.max_read > 0 and getlat(fe, ds) > ctx.max_read:
+			constraints.append("C_BAD_A_{0}_{1} : A_{0}_{1} = 0".format(fe, ds))
+
+	for fe, ds in itertools.product(aset, dcs):
+		if ctx.max_write > 0 and getlat(fe, ds) > ctx.max_write:
+			constraints.extend([
+				"C_BAD_DA_{0}_{1} : DA_{0}_{1} = 0".format(fe, ds),
+				"C_BAD_DW_{0}_{1} : DW_{0}_{1} = 0".format(fe, ds),
+				"C_BAD_W_{0}_{1} : W_{0}_{1} = 0".format(fe, ds),
+			])
+
+def add_bias_constraints(ctx: Context, constraints: List[str]):
+	aset = list(ctx.access_set_iter())
+	dcs = ctx.data_center_in_use
+
+	rdels = ["DA_{0}_{1}".format(fe, dc) for fe, dc in itertools.product(aset, dcs)]
+	sdels = ["DA_{0}_{0} + DW_{0}_{0}".format(fe) for fe in aset]
+
+	constraints.append("C_BIAS_NRDELS : {0} - NRDELS >= 0".format(sum_of(rdels)))
+	constraints.append("C_BIAS_NSDELS : {0} - NSDELS >= 0".format(sum_of(sdels)))
+
+def add_raw_constraints(ctx: Context, constraints: List[str]):
+	pass
+
+def output_constraints_function(ctx: Context, fout):
+	constraints = [] # type: List[str]
+	if ctx.multi_goal:
+		constraints.append("%%CONSTRAINTS_PREV_GOALS%%")
+	add_objective_latency_constraints(ctx, constraints)
+	add_delegate_constraints(ctx, constraints)
+	add_quorum_constraints(ctx, constraints)
+	add_data_center_selection_constraints(ctx, constraints)
+	add_data_center_number_constraints(ctx, constraints)
+	add_sym_constraints(ctx, constraints)
+	add_repl_constraints(ctx, constraints)
+	add_bad_constraints(ctx, constraints)
+	add_implementation_constraints(ctx, constraints)
+	add_bias_constraints(ctx, constraints)
+	add_no_flexible_constraints(ctx, constraints)
+	add_no_var_quorum_constraints(ctx, constraints)
+	add_raw_constraints(ctx, constraints)
+
+	generation.write_constraints(fout, constraints)
+
+def output_bounds(ctx: Context, fout):
+	aset = list(ctx.access_set_iter())
+	dcs = ctx.data_center_in_use
+
+	fout.write("\nBOUNDS\n")
+
+	def emit(s):
+		fout.write("\t")
+		fout.write(s)
+		fout.write("\n")
+
+	emit("-inf <= ISTOHEAD <= 0")
+	emit("NSPLITS >= 1")
+
+	for fe, dc in itertools.product(aset, dcs):
+		emit("P1RL_{0}_{1} >= 0".format(fe, dc))
+		emit("P1WL_{0}_{1} >= 0".format(fe, dc))
+		emit("P2RL_{0}_{1} >= 0".format(fe, dc))
+		emit("P2WL_{0}_{1} >= 0".format(fe, dc))
+
+def output_continuous(ctx: Context, fout):
+	aset = list(ctx.access_set_iter())
+	dcs = ctx.data_center_in_use
+
+	fout.write("\n\\ section for linting only\n")
+	fout.write("\\lpvet:CONTINUOUS\n")
+
+	def emit(s):
+		fout.write("\\lpvet:\t")
+		fout.write(s)
+		fout.write("\n")
+
+	emit("ISTOHEAD")
+	emit("UPDATE")
+	emit("L")
+	emit("WL")
+	emit("NRDELS")
+	emit("NSDELS")
+	emit("M_A")
+	emit("M_R")
+	emit("M_W")
+
+	for fe in aset:
+		emit("L_{0}".format(fe))
+		emit("WL_{0}".format(fe))
+
+	for fe, dc in itertools.product(aset, dcs):
+		emit("P1RL_{0}_{1}".format(fe, dc))
+		emit("P1WL_{0}_{1}".format(fe, dc))
+		emit("P2RL_{0}_{1}".format(fe, dc))
+		emit("P2WL_{0}_{1}".format(fe, dc))
+
+def output_general(ctx: Context, fout):
+	dcs = ctx.data_center_in_use
+
+	fout.write('\nGENERAL\n')
+
+	def emit(s):
+		fout.write("\t")
+		fout.write(s)
+		fout.write("\n")
+
+	emit("NSPLITS")
+	emit("NREPLICAS")
+	emit("M_A")
+	emit("M_R")
+	emit("M_W")
+
+def output_binary(ctx, fout):
+	aset = list(ctx.access_set_iter())
+	dcs = ctx.data_center_in_use
+
+	fout.write('\nBINARY\n')
+
+	def emit(s):
+		fout.write("\t")
+		fout.write(s)
+		fout.write("\n")
+
+	for fe, dc in itertools.product(aset, dcs):
+		emit("A_{0}_{1}".format(fe, dc))
+		emit("R_{0}_{1}".format(fe, dc))
+		emit("W_{0}_{1}".format(fe, dc))
+		emit("DA_{0}_{1}".format(fe, dc))
+		emit("DW_{0}_{1}".format(fe, dc))
+
+	for dc in dcs:
+		emit("C_{0}".format(dc))
+
+def main():
+	ctx = Context()
+	load_inputs(ctx)
+
+	with open(ctx.dest_lp_path, "w") as fout:
+		output_header(fout)
+		output_objective_function(ctx, fout, sys.stdout)
+		output_constraints_function(ctx, fout)
+		output_bounds(ctx, fout)
+		output_general(ctx, fout)
+		output_binary(ctx, fout)
+		output_continuous(ctx, fout)
+		fout.write("\nEND\n")
+
+if __name__ == "__main__":
+	main()
